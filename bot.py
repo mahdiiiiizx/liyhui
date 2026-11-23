@@ -452,24 +452,30 @@ async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> O
         return str(exc)
 
 
-async def add_fake_members(item_id: int, extra: int) -> Optional[str]:
+async def adjust_fake_members(item_id: int, delta: int) -> tuple:
     """
-    افزایش شمارنده‌ی ممبر الکی برای یک آیتم.
-    عدد نمایشی = ورودی‌های واقعی + fake_members
+    تغییر شمارنده‌ی ممبر الکی (delta مثبت = افزایش، منفی = کاهش).
+    عدد نمایشی = ورودی‌های واقعی + fake_members؛ مقدار هرگز زیر صفر نمی‌رود.
+    خروجی: (متن خطا یا None، مقدار جدید fake_members، مقدار واقعاً تغییرکرده)
     """
+    result: dict = {}
+
     def _run():
         existing = supabase.table("channels").select("fake_members").eq("id", item_id).execute().data
-        current_fake = int((existing[0].get("fake_members") or 0) if existing else 0)
-        supabase.table("channels").update({"fake_members": current_fake + extra}).eq("id", item_id).execute()
+        current_fake = max(int((existing[0].get("fake_members") or 0) if existing else 0), 0)
+        new_fake = max(current_fake + delta, 0)
+        supabase.table("channels").update({"fake_members": new_fake}).eq("id", item_id).execute()
+        result["new"] = new_fake
+        result["applied"] = new_fake - current_fake
 
     try:
         await asyncio.to_thread(_run)
         _cache_clear()
         _member_count_cache.clear()
-        return None
+        return None, result.get("new", 0), result.get("applied", 0)
     except Exception as exc:  # noqa: BLE001
-        logger.error("خطای دیتابیس هنگام افزایش ممبر الکی: %s", exc)
-        return str(exc)
+        logger.error("خطای دیتابیس هنگام تغییر ممبر الکی: %s", exc)
+        return str(exc), 0, 0
 
 
 async def _mark_quota_done(item: dict) -> None:
@@ -742,7 +748,7 @@ PENDING_BOT_ADD: set = set()
 PENDING_LINK_EDIT: dict = {}
 PENDING_ITEM_TIME: dict = {}   # user_id -> item_id (منتظر مدت زمان)
 PENDING_ITEM_QUOTA: dict = {}  # user_id -> (item_id، آیا بلافاصله بعد از افزودن است؟) منتظر تعداد ممبر
-PENDING_FAKE_MEMBERS: dict = {}  # user_id -> item_id (منتظر عدد افزایش ممبر الکی)
+PENDING_FAKE_MEMBERS: dict = {}  # user_id -> (item_id, "add" | "sub") (منتظر عدد تغییر ممبر الکی)
 PENDING_GROUP_SET: set = set()
 PENDING_DELETE_TIMER_SET: set = set()
 
@@ -1227,7 +1233,10 @@ def build_item_manage_keyboard(item: dict, count: Optional[int] = None) -> Inlin
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
         [InlineKeyboardButton(f"👥 {format_quota(item, count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
         [InlineKeyboardButton("🎯 تعرفه‌ی ممبر", callback_data=f"ch_quota_{item['id']}", style="primary")],
-        [InlineKeyboardButton("➕ افزایش ممبر", callback_data=f"ch_fake_{item['id']}", style="primary")],
+        [
+            InlineKeyboardButton("➕ افزایش ممبر", callback_data=f"ch_fake_{item['id']}", style="primary"),
+            InlineKeyboardButton("➖ کاهش ممبر", callback_data=f"ch_fakedec_{item['id']}", style="danger"),
+        ],
         [InlineKeyboardButton("🖼 گزارش تصویری", callback_data=f"ch_report_{item['id']}", style="success")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
@@ -1286,9 +1295,12 @@ async def release_report(item_id: int) -> None:
 
 
 async def build_item_report_png(bot, item: dict) -> bytes:
-    """گزارش قبل/بعد فقط با اعداد واقعی ساخته می‌شود (ممبر الکی در تصویر نمی‌آید)."""
+    """گزارش قبل/بعد با اعداد واقعی + fake_members ساخته می‌شود تا نمایش پنل با تصویر یکی باشد."""
     kind = item.get("kind", "channel")
-    joined = await fetch_member_count(bot, item, force=True) or 0
+    fake = get_fake_members(item)
+
+    real_joined = await fetch_member_count(bot, item, force=True) or 0
+    joined = real_joined + fake  # عدد سبز +N مطابق نمایش پنل
 
     chat_ref = f"@{item['chat_id']}" if kind == "bot" else item["chat_id"]
     name = item["title"]
@@ -1302,12 +1314,17 @@ async def build_item_report_png(bot, item: dict) -> bytes:
     except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
         logger.warning("دریافت پروفایل «%s» برای گزارش ممکن نشد: %s", item.get("title"), exc)
 
-    before = item.get("start_members") if isinstance(item.get("start_members"), int) else None
-    after = None
+    raw_before = item.get("start_members") if isinstance(item.get("start_members"), int) else None
+    # before: تعداد اعضا قبل از دوره + fake_members (همان نمایش پنل در شروع)
+    before = (raw_before + fake) if isinstance(raw_before, int) else None
+
+    raw_after = None
     try:
-        after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
+        raw_after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
     except (BadRequest, Forbidden, TimedOut, NetworkError):
         pass
+    # after: تعداد فعلی اعضا + fake_members (همان نمایش پنل در پایان)
+    after = (raw_after + fake) if isinstance(raw_after, int) else None
 
     return await asyncio.to_thread(report_image.render_report, name, photo_bytes, joined, before, after)
 
@@ -1412,7 +1429,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         PENDING_ITEM_TIME.pop(user_id, None)
     if not data.startswith("ch_quota_"):
         PENDING_ITEM_QUOTA.pop(user_id, None)
-    if not data.startswith("ch_fake_"):
+    if not data.startswith(("ch_fake_", "ch_fakedec_")):
         PENDING_FAKE_MEMBERS.pop(user_id, None)
 
     if data == "menu_main":
@@ -1512,19 +1529,24 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if "not modified" not in str(exc).lower():
                 raise
 
-    elif data.startswith("ch_fake_"):
+    elif data.startswith(("ch_fake_", "ch_fakedec_")):
+        mode = "sub" if data.startswith("ch_fakedec_") else "add"
         item_id = int(data.split("_")[-1])
         item = await get_item(item_id)
         if not item:
             await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
             return
-        PENDING_FAKE_MEMBERS[user_id] = item_id
         fake = get_fake_members(item)
+        if mode == "sub" and fake <= 0:
+            await query.answer("ممبر الکی‌ای برای کاهش وجود ندارد.", show_alert=True)
+            return
+        PENDING_FAKE_MEMBERS[user_id] = (item_id, mode)
         fake_note = f"\n\nتعداد فعلی ممبر الکی: <b>{fake:,}</b>" if fake > 0 else ""
+        verb = "کم" if mode == "sub" else "اضافه"
         await query.edit_message_text(
-            f"چند ممبر الکی به «<b>{html.escape(item['title'])}</b>» اضافه شود؟{fake_note}\n\n"
-            "یک عدد مثبت وارد کنید (مثلاً <code>100</code>).\n"
-            "این عدد فقط در نمایش پنل ادمین به تعداد واقعی اضافه می‌شود.",
+            f"چند ممبر الکی از «<b>{html.escape(item['title'])}</b>» {verb} شود؟{fake_note}\n\n"
+            "یک عدد مثبت وارد کنید (مثلاً <code>100</code>)."
+            + ("\nاگر عدد از ممبر الکی موجود بیشتر باشد، ممبر الکی صفر می‌شود." if mode == "sub" else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb(f"ch_view_{item_id}"),
         )
@@ -2035,20 +2057,20 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU)
         return
 
-    # حالت: افزایش ممبر الکی
+    # حالت: افزایش / کاهش ممبر الکی
     if user_id in PENDING_FAKE_MEMBERS:
-        item_id = PENDING_FAKE_MEMBERS.pop(user_id)
+        item_id, mode = PENDING_FAKE_MEMBERS.pop(user_id)
         raw = (message.text or "").strip()
-        extra = parse_member_limit(raw)
-        if extra is None or extra <= 0:
+        amount = parse_member_limit(raw)
+        if amount is None or amount <= 0:
             await message.reply_text(
                 "عدد نامعتبر است. یک عدد صحیح مثبت وارد کنید (مثلاً <code>100</code>).",
                 parse_mode=ParseMode.HTML,
                 reply_markup=back_kb(f"ch_view_{item_id}"),
             )
-            PENDING_FAKE_MEMBERS[user_id] = item_id  # برگردان به حالت انتظار
+            PENDING_FAKE_MEMBERS[user_id] = (item_id, mode)  # برگردان به حالت انتظار
             return
-        err = await add_fake_members(item_id, extra)
+        err, total_fake, applied = await adjust_fake_members(item_id, -amount if mode == "sub" else amount)
         if err:
             await message.reply_text(
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
@@ -2056,9 +2078,14 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             return
         item = await get_item(item_id)
         count = await fetch_member_count(context.bot, item) if item else None
-        total_fake = get_fake_members(item) if item else extra
+        if mode == "sub":
+            done = f"✅ {abs(applied):,} ممبر الکی کم شد."
+            if abs(applied) < amount:
+                done += f"\n(فقط {abs(applied):,} ممبر الکی وجود داشت.)"
+        else:
+            done = f"✅ {applied:,} ممبر الکی اضافه شد."
         await message.reply_text(
-            f"✅ {extra:,} ممبر الکی اضافه شد.\nجمع ممبر الکی: <b>{total_fake:,}</b>",
+            f"{done}\nجمع ممبر الکی: <b>{total_fake:,}</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU,
         )
