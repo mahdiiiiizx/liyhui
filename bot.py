@@ -1315,16 +1315,20 @@ async def build_item_report_png(bot, item: dict) -> bytes:
         logger.warning("دریافت پروفایل «%s» برای گزارش ممکن نشد: %s", item.get("title"), exc)
 
     raw_before = item.get("start_members") if isinstance(item.get("start_members"), int) else None
-    # before: تعداد اعضا قبل از دوره + fake_members (همان نمایش پنل در شروع)
-    before = (raw_before + fake) if isinstance(raw_before, int) else None
+    # before: تعداد اعضا در شروع دوره، بدون ممبر الکی (ممبر الکی فقط به «بعد» و عدد سبز اضافه می‌شود)
+    before = raw_before
 
-    raw_after = None
-    try:
-        raw_after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
-    except (BadRequest, Forbidden, TimedOut, NetworkError):
-        pass
-    # after: تعداد فعلی اعضا + fake_members (همان نمایش پنل در پایان)
-    after = (raw_after + fake) if isinstance(raw_after, int) else None
+    if isinstance(raw_before, int):
+        # after = قبل + ممبر جذب‌شده (واقعی + الکی)؛ تا اضافه/کم‌کردن ممبر مستقیماً در تصویر دیده شود
+        # و همیشه after - before == عدد سبز +N باشد
+        after = raw_before + joined
+    else:
+        raw_after = None
+        try:
+            raw_after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
+        except (BadRequest, Forbidden, TimedOut, NetworkError):
+            pass
+        after = (raw_after + fake) if isinstance(raw_after, int) else None
 
     return await asyncio.to_thread(report_image.render_report, name, photo_bytes, joined, before, after)
 
@@ -1347,7 +1351,7 @@ async def send_item_report(bot, item: dict, reason: str = "expired", claim: bool
             item["report_sent"] = False
         return False
 
-    joined = await fetch_member_count(bot, item) or 0
+    joined = (await fetch_member_count(bot, item) or 0) + get_fake_members(item)  # مطابق عدد سبز تصویر
     caption = (
         f"📊 <b>{html.escape(item['title'])}</b>\n"
         f"✅ ممبر جذب‌شده از طریق ربات: <b>{joined:,}</b>\n"
